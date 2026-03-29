@@ -1,0 +1,87 @@
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.suo
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BACKEND (Python / FastAPI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Virtual environments
+backend/venv/
+backend/.venv/
+backend/env/
+
+# Python cache
+backend/**/__pycache__/
+backend/**/*.pyc
+backend/**/*.pyo
+backend/**/*.pyd
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+
+# Environment & secrets — NEVER commit these
+backend/.env
+backend/firebase-credentials.json
+
+# Compiled / dist
+backend/**/*.egg-info/
+backend/dist/
+backend/build/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FRONTEND (Next.js / Node)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Dependencies
+frontend/node_modules/
+
+# Next.js build output
+frontend/.next/
+frontend/out/
+
+# Environment & secrets — NEVER commit these
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# Yarn / npm
+frontend/yarn-error.log
+frontend/.yarn/cache
+frontend/.pnp.*
+
+# TypeScript
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOCKER / INFRA
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Root-level env (used by docker compose)
+.env
+.env.local
+
+# Firebase service account (NEVER commit)
+firebase-credentials.json
+*-credentials.json
+*-service-account.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MISC
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Logs
+*.log
+logs/
+
+# Zip exports
+*.zip

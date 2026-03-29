@@ -1,0 +1,55 @@
+version: "3.9"
+
+# ── MoodFlix Full Stack ────────────────────────────────────────────────────────
+# Run with: docker compose up --build
+# Both services are behind the same network; frontend proxies /api/* to backend.
+
+services:
+
+  # ── Python FastAPI backend ─────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: moodflix-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - FIREBASE_CREDENTIALS_PATH=/run/secrets/firebase_creds
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - ALLOWED_ORIGINS=http://localhost:3000,https://yourdomain.com
+    secrets:
+      - firebase_creds
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Next.js frontend ───────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: moodflix-web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_FIREBASE_API_KEY=${NEXT_PUBLIC_FIREBASE_API_KEY}
+      - NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN}
+      - NEXT_PUBLIC_FIREBASE_PROJECT_ID=${NEXT_PUBLIC_FIREBASE_PROJECT_ID}
+      - NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=${NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET}
+      - NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=${NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID}
+      - NEXT_PUBLIC_FIREBASE_APP_ID=${NEXT_PUBLIC_FIREBASE_APP_ID}
+    depends_on:
+      backend:
+        condition: service_healthy
+
+# ── Secrets ────────────────────────────────────────────────────────────────────
+# Place your firebase-credentials.json in the project root
+secrets:
+  firebase_creds:
+    file: ./firebase-credentials.json
