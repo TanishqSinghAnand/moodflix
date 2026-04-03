@@ -42,20 +42,23 @@ Until then, the cosine recommender in recommender.py is used as fallback.
 from __future__ import annotations
 import logging
 import pickle
-import numpy as np
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Check if lightfm is available ─────────────────────────────────────────────
+# ── Check if lightfm + numpy are available ────────────────────────────────────
+# All ML deps are optional. App starts fine without them — cosine fallback used.
 try:
+    import numpy as np
     from lightfm import LightFM
     from lightfm.data import Dataset
     from scipy.sparse import csr_matrix
     LIGHTFM_AVAILABLE = True
 except ImportError:
+    np = None  # type: ignore
     LIGHTFM_AVAILABLE = False
-    logger.warning("LightFM not installed. Run: pip install lightfm scipy numpy")
+    logger.info("LightFM/numpy not installed — ML recs disabled. "
+                "Uncomment lightfm/scipy/numpy in requirements.txt to enable.")
 
 # ── All genre features used as item side-features ─────────────────────────────
 ALL_GENRES = [
