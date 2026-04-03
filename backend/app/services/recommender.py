@@ -1,31 +1,34 @@
 """
 Recommendation Engine — hybrid CF + mood reranking.
 
-Pipeline:
-  1. Load user's watch history from Firestore → build genre preference vector
-  2. Fetch candidate titles from TMDB (trending + genre-filtered)
-  3. Score each candidate:
-       cf_score    = cosine similarity of title genre vector vs user preference vector
-       mood_score  = dot product of title genres vs session genre weights
-       final_score = 0.5 * cf_score + 0.5 * mood_score  (tunable α)
-  4. Inject one serendipity pick (high mood score, low cf_score = discovery)
-  5. Return top-N results
+V2 Improvements over V1:
+  1. Popularity boost   — well-rated popular titles score higher
+  2. Recency weighting  — recently watched genres carry more weight
+  3. Genre diversity    — final results capped per genre (max 3 per genre)
+                          + ensures mix of movies/series/anime
 
-This design is intentionally lightweight — no ML training infra needed for V1.
-A future V2 can swap step 1–3 for a proper matrix factorization model trained
-offline and served via a vector DB (e.g. Pinecone or Vertex AI Matching Engine).
+Pipeline:
+  1. Load user's watch history → build RECENCY-WEIGHTED genre preference vector
+  2. Fetch candidate titles from TMDB (genre-filtered)
+  3. Score each candidate:
+       cf_score         = cosine similarity(user vector, title genre vector)
+       mood_score       = cosine similarity(title genres, mood genre weights)
+       popularity_score = log-normalized TMDB vote count + rating
+       final_score      = 0.4*cf + 0.4*mood + 0.2*popularity
+  4. Apply genre diversity cap to final results
+  5. Inject serendipity pick (high mood, low CF)
+  6. Return top-N diverse results
 """
 
 from __future__ import annotations
-import asyncio
 import math
 import random
 import httpx
 import logging
-from typing import Optional
+from datetime import datetime, timezone
 
 from app.config import settings
-from app.models.schemas import RecommendedTitle, MediaType, MoodTag, Platform
+from app.models.schemas import RecommendedTitle, MediaType, MoodTag
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,6 @@ TMDB_GENRE_MAP = {
     10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
 }
 
-# Mood tags inferred from genre combinations (simple heuristic for V1)
 GENRE_TO_MOOD: dict[str, list[MoodTag]] = {
     "Action":           [MoodTag.THRILLING, MoodTag.ADVENTUROUS],
     "Adventure":        [MoodTag.ADVENTUROUS],
@@ -57,6 +59,12 @@ GENRE_TO_MOOD: dict[str, list[MoodTag]] = {
     "Thriller":         [MoodTag.THRILLING, MoodTag.DARK],
 }
 
+# ── Diversity config ───────────────────────────────────────────────────────────
+MAX_PER_GENRE = 3   # max titles sharing the same primary genre in final list
+MAX_PER_TYPE  = 8   # max movies or series in final list
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _genres_from_ids(genre_ids: list[int]) -> list[str]:
     return [TMDB_GENRE_MAP[g] for g in genre_ids if g in TMDB_GENRE_MAP]
@@ -74,7 +82,7 @@ def _cosine(vec_a: dict[str, float], vec_b: dict[str, float]) -> float:
     keys = set(vec_a) & set(vec_b)
     if not keys:
         return 0.0
-    dot = sum(vec_a[k] * vec_b[k] for k in keys)
+    dot   = sum(vec_a[k] * vec_b[k] for k in keys)
     mag_a = math.sqrt(sum(v ** 2 for v in vec_a.values()))
     mag_b = math.sqrt(sum(v ** 2 for v in vec_b.values()))
     if mag_a == 0 or mag_b == 0:
@@ -82,88 +90,187 @@ def _cosine(vec_a: dict[str, float], vec_b: dict[str, float]) -> float:
     return dot / (mag_a * mag_b)
 
 
+# ── Improvement 2: Recency-weighted user vector ────────────────────────────────
+
+def _recency_weight(watched_at_str: str | None) -> float:
+    """
+    Returns a weight between 0.1 and 1.0 based on how recently something was watched.
+    - Watched today       → 1.0
+    - Watched 30 days ago → ~0.6
+    - Watched 1 year ago  → ~0.2
+    - No date             → 0.3 (moderate default)
+    Formula: 1 / (1 + log(days_ago + 1))
+    """
+    if not watched_at_str:
+        return 0.3
+    try:
+        date_part    = watched_at_str[:10]
+        watched_date = datetime.strptime(date_part, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        days_ago     = max((datetime.now(timezone.utc) - watched_date).days, 0)
+        return round(1.0 / (1.0 + math.log(days_ago + 1)), 4)
+    except Exception:
+        return 0.3
+
+
 def _build_user_vector(watch_history: list[dict]) -> dict[str, float]:
     """
-    Build a genre preference vector from raw watch history.
-    Each watched genre increments its count; result is L1-normalized.
+    Build a recency-weighted genre preference vector from watch history.
+    Recent watches carry more weight than old ones.
+    Result is L1-normalized to [0, 1].
     """
-    counts: dict[str, float] = {}
+    weighted_counts: dict[str, float] = {}
     for entry in watch_history:
+        weight = _recency_weight(entry.get("watched_at"))
         for genre in entry.get("genres", []):
-            counts[genre] = counts.get(genre, 0.0) + 1.0
+            weighted_counts[genre] = weighted_counts.get(genre, 0.0) + weight
+    total = sum(weighted_counts.values()) or 1.0
+    return {g: round(c / total, 4) for g, c in weighted_counts.items()}
 
-    total = sum(counts.values()) or 1.0
-    return {g: c / total for g, c in counts.items()}
 
+# ── Improvement 1: Popularity score ───────────────────────────────────────────
+
+_MAX_LOG_VOTES = math.log(35_000 + 1)
+_MAX_RATING    = 10.0
+
+
+def _popularity_score(raw: dict) -> float:
+    """
+    Compute a 0-1 popularity score combining vote count (log-scaled) and rating.
+    Formula: 0.6 * log_normalized_votes + 0.4 * normalized_rating
+    Log scaling prevents mega-blockbusters from dominating everything.
+    """
+    vote_count  = raw.get("vote_count", 0) or 0
+    vote_avg    = raw.get("vote_average", 0.0) or 0.0
+    log_votes   = math.log(vote_count + 1) / _MAX_LOG_VOTES
+    norm_rating = vote_avg / _MAX_RATING
+    return round(min(0.6 * log_votes + 0.4 * norm_rating, 1.0), 4)
+
+
+# ── TMDB fetching ──────────────────────────────────────────────────────────────
 
 async def _fetch_tmdb_candidates(genre_weights: dict[str, float], limit: int = 50) -> list[dict]:
     """
-    Fetch trending movies + shows from TMDB.
-    Uses genre_weights to bias the genre filter parameters.
-    Returns raw TMDB result dicts.
+    Fetch movies + TV shows from TMDB filtered by top mood genres.
+    Fetches 2 pages per type for a richer, more diverse candidate pool.
+    Filters out titles with fewer than 50 votes (avoids obscure low-quality results).
     """
     if not settings.TMDB_API_KEY:
         logger.warning("TMDB_API_KEY not set — returning empty candidates.")
         return []
 
-    # Pick top 3 genres by weight to use as TMDB genre filter
-    top_genres = sorted(genre_weights.items(), key=lambda x: x[1], reverse=True)[:3]
+    top_genres   = sorted(genre_weights.items(), key=lambda x: x[1], reverse=True)[:3]
     genre_id_map = {v: k for k, v in TMDB_GENRE_MAP.items()}
-    genre_ids = [str(genre_id_map[g]) for g, _ in top_genres if g in genre_id_map]
+    genre_ids    = [str(genre_id_map[g]) for g, _ in top_genres if g in genre_id_map]
 
-    params = {
-        "api_key": settings.TMDB_API_KEY,
-        "with_genres": ",".join(genre_ids),
-        "sort_by": "popularity.desc",
-        "page": 1,
+    base_params = {
+        "api_key":        settings.TMDB_API_KEY,
+        "with_genres":    ",".join(genre_ids),
+        "sort_by":        "popularity.desc",
+        "vote_count.gte": 50,  # filter out very obscure titles
     }
 
+    results: list[dict] = []
     async with httpx.AsyncClient(timeout=10) as client:
-        results = []
         for endpoint in ["discover/movie", "discover/tv"]:
-            try:
-                r = await client.get(f"{settings.TMDB_BASE_URL}/{endpoint}", params=params)
-                r.raise_for_status()
-                results.extend(r.json().get("results", [])[:limit // 2])
-            except Exception as exc:
-                logger.error("TMDB fetch error for %s: %s", endpoint, exc)
+            for page in [1, 2]:
+                try:
+                    r = await client.get(
+                        f"{settings.TMDB_BASE_URL}/{endpoint}",
+                        params={**base_params, "page": page},
+                    )
+                    r.raise_for_status()
+                    results.extend(r.json().get("results", []))
+                except Exception as exc:
+                    logger.error("TMDB fetch error for %s page %s: %s", endpoint, page, exc)
 
-    return results
+    # Deduplicate by TMDB id
+    seen: set[int] = set()
+    unique = []
+    for r in results:
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            unique.append(r)
 
+    return unique
+
+
+# ── Scoring ────────────────────────────────────────────────────────────────────
 
 def _score_candidate(
     candidate: dict,
     user_vector: dict[str, float],
     genre_weights: dict[str, float],
-    mood_tags: list[MoodTag],
-    alpha: float = 0.5,
-) -> tuple[float, float, float]:
+    moods: list[MoodTag],
+) -> tuple[float, float, float, float]:
     """
-    Score a single candidate title.
-    Returns (cf_score, mood_score, final_score).
-    alpha controls the CF vs mood tradeoff (0=all mood, 1=all CF).
+    Score a single candidate. Returns (cf, mood, popularity, final).
+    Weights: 40% CF + 40% Mood + 20% Popularity
     """
-    genres = _genres_from_ids(candidate.get("genre_ids", []))
+    genres       = _genres_from_ids(candidate.get("genre_ids", []))
     title_vector = {g: 1.0 for g in genres}
 
-    cf_score    = _cosine(user_vector, title_vector)
-    mood_score  = _cosine(title_vector, genre_weights)
-    final_score = alpha * cf_score + (1 - alpha) * mood_score
+    cf_score   = _cosine(user_vector, title_vector)
+    mood_score = _cosine(title_vector, genre_weights)
+    pop_score  = _popularity_score(candidate)
+    final      = 0.4 * cf_score + 0.4 * mood_score + 0.2 * pop_score
 
-    return round(cf_score, 4), round(mood_score, 4), round(final_score, 4)
+    return round(cf_score, 4), round(mood_score, 4), round(pop_score, 4), round(final, 4)
 
 
-def _build_reason(moods: list[MoodTag], genres: list[str], is_serendipity: bool) -> str:
-    """Generate a short human-readable reason string for the UI."""
+# ── Improvement 3: Genre diversity ────────────────────────────────────────────
+
+def _apply_diversity(
+    scored: list[tuple[float, float, float, float, dict]],
+    limit: int,
+    serendipity_id: str | None,
+) -> list[tuple[float, float, float, float, dict]]:
+    """
+    Select top-N results while enforcing:
+    - Max 3 titles per primary genre (no 8 Action movies)
+    - Max 8 movies OR series (ensures mixed media types)
+    - Serendipity pick excluded from main list
+    """
+    genre_counts: dict[str, int] = {}
+    type_counts:  dict[str, int] = {"movie": 0, "series": 0}
+    selected = []
+
+    for cf, mood, pop, final, raw in scored:
+        if len(selected) >= limit:
+            break
+
+        if f"tmdb-{raw['id']}" == serendipity_id:
+            continue
+
+        genres     = _genres_from_ids(raw.get("genre_ids", []))
+        primary    = genres[0] if genres else "Unknown"
+        media_type = "movie" if "title" in raw else "series"
+
+        if genre_counts.get(primary, 0) >= MAX_PER_GENRE:
+            continue
+        if type_counts[media_type] >= MAX_PER_TYPE:
+            continue
+
+        genre_counts[primary]   = genre_counts.get(primary, 0) + 1
+        type_counts[media_type] += 1
+        selected.append((cf, mood, pop, final, raw))
+
+    return selected
+
+
+# ── Title builder ──────────────────────────────────────────────────────────────
+
+def _build_reason(moods: list[MoodTag], genres: list[str], is_serendipity: bool, pop_score: float) -> str:
     if is_serendipity:
         return "✨ Something new — step outside your comfort zone"
-    mood_labels = [m.value.replace("_", " ") for m in moods[:2]]
+    mood_labels  = [m.value.replace("_", " ") for m in moods[:2]]
     genre_labels = genres[:2]
-    parts = []
+    parts        = []
     if mood_labels:
         parts.append(f"Matches your {' & '.join(mood_labels)} vibe")
     if genre_labels:
         parts.append(f"({', '.join(genre_labels)})")
+    if pop_score > 0.7:
+        parts.append("· Highly rated")
     return " ".join(parts) or "Picked for you"
 
 
@@ -171,14 +278,14 @@ def _tmdb_to_title(
     raw: dict,
     cf_score: float,
     mood_score: float,
+    pop_score: float,
     final_score: float,
     moods: list[MoodTag],
     is_serendipity: bool = False,
 ) -> RecommendedTitle:
-    """Convert a raw TMDB result dict into a RecommendedTitle model."""
-    genres   = _genres_from_ids(raw.get("genre_ids", []))
+    genres    = _genres_from_ids(raw.get("genre_ids", []))
     mood_tags = _mood_tags_from_genres(genres)
-    is_movie  = "title" in raw  # TMDB uses "title" for movies, "name" for TV
+    is_movie  = "title" in raw
 
     return RecommendedTitle(
         id=f"tmdb-{raw['id']}",
@@ -196,15 +303,18 @@ def _tmdb_to_title(
         ),
         overview=raw.get("overview"),
         release_year=(
-            int(raw.get("release_date", "0")[:4]) if raw.get("release_date") else None
+            int(raw.get("release_date", "0000")[:4])
+            if raw.get("release_date") else None
         ),
         rating=raw.get("vote_average"),
         cf_score=cf_score,
         mood_score=mood_score,
         final_score=final_score,
-        reason=_build_reason(moods, genres, is_serendipity),
+        reason=_build_reason(moods, genres, is_serendipity, pop_score),
     )
 
+
+# ── Main entry point ───────────────────────────────────────────────────────────
 
 async def generate_recommendations(
     user_watch_history: list[dict],
@@ -213,48 +323,46 @@ async def generate_recommendations(
     exclude_ids: set[str] | None = None,
 ) -> tuple[list[RecommendedTitle], RecommendedTitle | None]:
     """
-    Main entry point for the recommendation pipeline.
-
-    Returns:
-        (recommendations, serendipity_pick)
+    Full V2 recommendation pipeline.
+    Returns: (recommendations, serendipity_pick)
     """
     moods         = [MoodTag(m) for m in mood_session.get("moods", [])]
     genre_weights = mood_session.get("genre_weights", {})
     exclude_ids   = exclude_ids or set()
 
-    # Step 1: Build user preference vector from watch history
+    # Step 1: Recency-weighted user vector
     user_vector = _build_user_vector(user_watch_history)
+    if not user_vector:
+        logger.info("Cold start — no watch history, using mood-only scoring")
 
-    # Step 2: Fetch candidates from TMDB
+    # Step 2: Fetch candidates
     candidates = await _fetch_tmdb_candidates(genre_weights, limit=settings.CF_CANDIDATE_POOL_SIZE)
 
-    # Step 3: Score & filter candidates
-    scored: list[tuple[float, float, float, dict]] = []
+    # Step 3: Score all candidates
+    scored: list[tuple[float, float, float, float, dict]] = []
     for c in candidates:
         if f"tmdb-{c['id']}" in exclude_ids:
             continue
-        cf, mood, final = _score_candidate(c, user_vector, genre_weights, moods)
-        scored.append((cf, mood, final, c))
+        cf, mood, pop, final = _score_candidate(c, user_vector, genre_weights, moods)
+        scored.append((cf, mood, pop, final, c))
 
-    # Sort by final score descending
-    scored.sort(key=lambda x: x[2], reverse=True)
+    scored.sort(key=lambda x: x[3], reverse=True)
 
-    # Step 4: Pick serendipity item (high mood score, low CF — a discovery)
+    # Step 4: Serendipity pick (high mood + low CF + decent popularity)
     serendipity_pick: RecommendedTitle | None = None
-    discovery_candidates = [s for s in scored if s[0] < 0.2 and s[1] > 0.4]
-    if discovery_candidates:
-        pick = random.choice(discovery_candidates[:5])
-        cf, mood, final, raw = pick
-        serendipity_pick = _tmdb_to_title(raw, cf, mood, final, moods, is_serendipity=True)
+    discovery_pool = [s for s in scored if s[0] < 0.2 and s[1] > 0.4 and s[2] > 0.3]
+    if discovery_pool:
+        pick = random.choice(discovery_pool[:5])
+        cf, mood, pop, final, raw = pick
+        serendipity_pick = _tmdb_to_title(raw, cf, mood, pop, final, moods, is_serendipity=True)
 
-    # Step 5: Top-N recommendations (exclude serendipity pick)
     serendipity_id = serendipity_pick.id if serendipity_pick else None
-    recs = []
-    for cf, mood, final, raw in scored:
-        if len(recs) >= limit:
-            break
-        t = _tmdb_to_title(raw, cf, mood, final, moods)
-        if t.id != serendipity_id:
-            recs.append(t)
 
+    # Step 5: Genre-diverse top-N selection
+    diverse = _apply_diversity(scored, limit, serendipity_id)
+
+    # Step 6: Build response objects
+    recs = [_tmdb_to_title(raw, cf, mood, pop, final, moods) for cf, mood, pop, final, raw in diverse]
+
+    logger.info("Recs: %d returned from %d candidates", len(recs), len(candidates))
     return recs, serendipity_pick
