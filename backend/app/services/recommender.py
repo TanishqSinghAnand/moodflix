@@ -60,8 +60,11 @@ GENRE_TO_MOOD: dict[str, list[MoodTag]] = {
 }
 
 # ── Diversity config ───────────────────────────────────────────────────────────
-MAX_PER_GENRE = 3   # max titles sharing the same primary genre in final list
-MAX_PER_TYPE  = 8   # max movies or series in final list
+MAX_PER_GENRE  = 2   # max titles sharing the same primary genre (was 3)
+MAX_PER_TYPE   = 6   # max movies OR series out of 12 total (was 8)
+MAX_ANIMATION  = 3   # hard cap on Animation-primary titles
+MIN_MOVIES     = 3   # guaranteed minimum movies in every result set
+MIN_SERIES     = 3   # guaranteed minimum series in every result set
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -225,18 +228,28 @@ def _apply_diversity(
     serendipity_id: str | None,
 ) -> list[tuple[float, float, float, float, dict]]:
     """
-    Select top-N results while enforcing:
-    - Max 3 titles per primary genre (no 8 Action movies)
-    - Max 8 movies OR series (ensures mixed media types)
-    - Serendipity pick excluded from main list
-    """
-    genre_counts: dict[str, int] = {}
-    type_counts:  dict[str, int] = {"movie": 0, "series": 0}
-    selected = []
+    Select top-N results with strict mix enforcement.
 
-    for cf, mood, pop, final, raw in scored:
-        if len(selected) >= limit:
-            break
+    Rules (for a limit of 12):
+    - Max 2 titles per primary genre (was 3) — prevents genre monotony
+    - Max 3 Animation-primary titles — stops all-anime results
+    - Max 6 movies OR 6 series — guarantees both types appear
+    - GUARANTEED minimums: at least 3 movies + 3 series always included
+      even if their scores are lower (two-pass selection)
+
+    Two-pass approach:
+      Pass 1: score-ordered selection respecting all caps
+      Pass 2: if minimums not met, backfill from remaining candidates
+    """
+    genre_counts:  dict[str, int] = {}
+    type_counts:   dict[str, int] = {"movie": 0, "series": 0}
+    anim_count:    int = 0
+    selected = []
+    remaining = []  # candidates not selected in pass 1 (for backfill)
+
+    # ── Pass 1: score-ordered selection with caps ─────────────────────────────
+    for item in scored:
+        cf, mood, pop, final, raw = item
 
         if f"tmdb-{raw['id']}" == serendipity_id:
             continue
@@ -244,17 +257,50 @@ def _apply_diversity(
         genres     = _genres_from_ids(raw.get("genre_ids", []))
         primary    = genres[0] if genres else "Unknown"
         media_type = "movie" if "title" in raw else "series"
+        is_anim    = primary == "Animation"
 
+        # Apply caps
         if genre_counts.get(primary, 0) >= MAX_PER_GENRE:
+            remaining.append(item)
             continue
         if type_counts[media_type] >= MAX_PER_TYPE:
+            remaining.append(item)
+            continue
+        if is_anim and anim_count >= MAX_ANIMATION:
+            remaining.append(item)
             continue
 
         genre_counts[primary]   = genre_counts.get(primary, 0) + 1
         type_counts[media_type] += 1
-        selected.append((cf, mood, pop, final, raw))
+        if is_anim:
+            anim_count += 1
+        selected.append(item)
 
-    return selected
+        if len(selected) >= limit:
+            break
+
+    # ── Pass 2: backfill to hit guaranteed minimums ───────────────────────────
+    # If we don't have enough movies, pull best-scoring movies from remaining
+    for media_type, minimum in [("movie", MIN_MOVIES), ("series", MIN_SERIES)]:
+        if type_counts[media_type] >= minimum:
+            continue  # already have enough
+
+        needed = minimum - type_counts[media_type]
+        backfill_pool = [
+            item for item in remaining
+            if ("title" in item[4]) == (media_type == "movie")
+            and f"tmdb-{item[4]['id']}" not in {f"tmdb-{s[4]['id']}" for s in selected}
+        ]
+
+        for item in backfill_pool[:needed]:
+            cf, mood, pop, final, raw = item
+            media_type_item = "movie" if "title" in raw else "series"
+            type_counts[media_type_item] += 1
+            selected.append(item)
+
+    # Re-sort selected by final score (backfilled items may have lower scores)
+    selected.sort(key=lambda x: x[3], reverse=True)
+    return selected[:limit]
 
 
 # ── Title builder ──────────────────────────────────────────────────────────────
