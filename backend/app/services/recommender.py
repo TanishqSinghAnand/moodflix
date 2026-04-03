@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 
 from app.config import settings
 from app.models.schemas import RecommendedTitle, MediaType, MoodTag
+from app.services import lightfm_service
 
 logger = logging.getLogger(__name__)
 
@@ -367,34 +368,85 @@ async def generate_recommendations(
     mood_session: dict,
     limit: int = 12,
     exclude_ids: set[str] | None = None,
+    uid: str | None = None,
+    onboarding_vector: dict[str, float] | None = None,
 ) -> tuple[list[RecommendedTitle], RecommendedTitle | None]:
     """
-    Full V2 recommendation pipeline.
+    Full V3 recommendation pipeline.
+
+    New in V3:
+    - uid + onboarding_vector: used for cold-start personalisation
+    - LightFM scores: blended in when model is trained and user is known
+    - Onboarding vector used as fallback when watch_history is empty
+
+    Score composition:
+      If LightFM trained + user known:
+        final = 0.35*lightfm + 0.3*mood + 0.2*cf_cosine + 0.15*popularity
+      Else (cosine fallback):
+        final = 0.4*cf_cosine + 0.4*mood + 0.2*popularity
+
     Returns: (recommendations, serendipity_pick)
     """
     moods         = [MoodTag(m) for m in mood_session.get("moods", [])]
     genre_weights = mood_session.get("genre_weights", {})
     exclude_ids   = exclude_ids or set()
 
-    # Step 1: Recency-weighted user vector
+    # ── Step 1: Build user preference vector ──────────────────────────────────
+    # Priority: real watch history > onboarding vector > empty (cold start)
     user_vector = _build_user_vector(user_watch_history)
-    if not user_vector:
-        logger.info("Cold start — no watch history, using mood-only scoring")
 
-    # Step 2: Fetch candidates
+    if not user_vector and onboarding_vector:
+        # Cold-start: use synthetic vector from onboarding quiz
+        user_vector = onboarding_vector
+        logger.info("Cold start — using onboarding vector for uid=%s", uid)
+    elif not user_vector:
+        logger.info("Cold start — no history or onboarding vector, mood-only scoring")
+
+    # ── Step 2: Fetch candidates from TMDB ────────────────────────────────────
     candidates = await _fetch_tmdb_candidates(genre_weights, limit=settings.CF_CANDIDATE_POOL_SIZE)
 
-    # Step 3: Score all candidates
+    # ── Step 3: Get LightFM scores if model available ─────────────────────────
+    use_lightfm = lightfm_service.is_trained() and uid is not None
+    lightfm_scores: dict[str, float] = {}
+
+    if use_lightfm:
+        candidate_ids  = [f"tmdb-{c['id']}" for c in candidates]
+        raw_lfm_scores = lightfm_service.score_candidates(uid, candidate_ids, user_vector)
+
+        if raw_lfm_scores:
+            # Normalize LightFM scores to [0, 1] using min-max scaling
+            vals = list(raw_lfm_scores.values())
+            min_v, max_v = min(vals), max(vals)
+            rng = max_v - min_v or 1.0
+            lightfm_scores = {k: round((v - min_v) / rng, 4) for k, v in raw_lfm_scores.items()}
+            logger.info("LightFM scores available for %d candidates", len(lightfm_scores))
+        else:
+            use_lightfm = False  # user not in training set, fall back to cosine
+            logger.debug("LightFM returned no scores — cosine fallback")
+
+    # ── Step 4: Score all candidates ──────────────────────────────────────────
     scored: list[tuple[float, float, float, float, dict]] = []
+
     for c in candidates:
-        if f"tmdb-{c['id']}" in exclude_ids:
+        title_id = f"tmdb-{c['id']}"
+        if title_id in exclude_ids:
             continue
-        cf, mood, pop, final = _score_candidate(c, user_vector, genre_weights, moods)
-        scored.append((cf, mood, pop, final, c))
+
+        cf, mood, pop, _ = _score_candidate(c, user_vector, genre_weights, moods)
+
+        if use_lightfm and title_id in lightfm_scores:
+            # Blend: LightFM captures deep collaborative patterns, cosine fills gaps
+            lfm   = lightfm_scores[title_id]
+            final = 0.35 * lfm + 0.30 * mood + 0.20 * cf + 0.15 * pop
+        else:
+            # Pure cosine fallback
+            final = 0.40 * cf + 0.40 * mood + 0.20 * pop
+
+        scored.append((cf, mood, pop, round(final, 4), c))
 
     scored.sort(key=lambda x: x[3], reverse=True)
 
-    # Step 4: Serendipity pick (high mood + low CF + decent popularity)
+    # ── Step 5: Serendipity pick ───────────────────────────────────────────────
     serendipity_pick: RecommendedTitle | None = None
     discovery_pool = [s for s in scored if s[0] < 0.2 and s[1] > 0.4 and s[2] > 0.3]
     if discovery_pool:
@@ -404,11 +456,14 @@ async def generate_recommendations(
 
     serendipity_id = serendipity_pick.id if serendipity_pick else None
 
-    # Step 5: Genre-diverse top-N selection
+    # ── Step 6: Genre-diverse top-N selection ─────────────────────────────────
     diverse = _apply_diversity(scored, limit, serendipity_id)
 
-    # Step 6: Build response objects
+    # ── Step 7: Build response objects ────────────────────────────────────────
     recs = [_tmdb_to_title(raw, cf, mood, pop, final, moods) for cf, mood, pop, final, raw in diverse]
 
-    logger.info("Recs: %d returned from %d candidates", len(recs), len(candidates))
+    logger.info(
+        "Recs: %d returned | candidates=%d | lightfm=%s | uid=%s",
+        len(recs), len(candidates), use_lightfm, uid
+    )
     return recs, serendipity_pick

@@ -15,7 +15,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 import logging
 
-from app.routers import auth, users, mood, recommendations, import_history
+from app.routers import auth, users, mood, recommendations, import_history, onboarding, admin
 from app.services.firebase import init_firebase
 from app.config import settings
 
@@ -66,6 +66,8 @@ app.include_router(users.router,           prefix="/api/v1/users",           tag
 app.include_router(mood.router,            prefix="/api/v1/mood",            tags=["Mood"])
 app.include_router(recommendations.router, prefix="/api/v1/recommendations", tags=["Recommendations"])
 app.include_router(import_history.router,  prefix="/api/v1/import",          tags=["Import"])
+app.include_router(onboarding.router,      prefix="/api/v1/onboarding",       tags=["Onboarding"])
+app.include_router(admin.router,           prefix="/api/v1/admin",            tags=["Admin"])
 
 
 @app.get("/api/health", tags=["Health"])

@@ -1,24 +1,21 @@
 """
 /api/v1/mood — Mood session endpoints.
 
-A mood session is a lightweight Firestore doc keyed by a UUID.
-It stores the selected moods + derived genre weights used by the
-recommendation engine. Sessions expire after 24 h (handled by
-a Firestore TTL policy in production).
+V2 changes:
+- MoodSubmit now accepts per-mood intensity (MoodIntensity objects)
+- Genre weights are scaled by each mood's individual intensity
+- e.g. Funny@8 contributes 8x more than Relaxing@1 to the final weights
 """
 
 import uuid
 from fastapi import APIRouter, Depends
-from app.models.schemas import MoodSubmit, MoodResponse, MoodTag
+from app.models.schemas import MoodSubmit, MoodResponse, MoodTag, MoodIntensity
 from app.services.firebase import get_db
 from app.dependencies import get_current_user
 
 router = APIRouter()
 
-# ── Mood → TMDB genre weight mapping ─────────────────────────────────────────
-# Keys are TMDB genre names; values are weights applied during reranking.
-# Weights are additive — a title can accumulate from multiple matching moods.
-
+# ── Mood → TMDB genre weight mapping ──────────────────────────────────────────
 MOOD_GENRE_WEIGHTS: dict[MoodTag, dict[str, float]] = {
     MoodTag.UPLIFTING:    {"Comedy": 1.0, "Family": 0.8, "Animation": 0.7, "Music": 0.5},
     MoodTag.RELAXING:     {"Documentary": 0.9, "Animation": 0.7, "Romance": 0.6, "Drama": 0.5},
@@ -33,15 +30,24 @@ MOOD_GENRE_WEIGHTS: dict[MoodTag, dict[str, float]] = {
 }
 
 
-def compute_genre_weights(moods: list[MoodTag]) -> dict[str, float]:
+def compute_genre_weights(mood_intensities: list[MoodIntensity]) -> dict[str, float]:
     """
-    Aggregate genre weights from multiple moods.
-    Weights are summed then normalized to [0, 1].
+    Aggregate genre weights from multiple moods, scaled by per-mood intensity.
+
+    V2 vs V1:
+      V1: all moods contributed equally regardless of intensity
+      V2: each mood's contribution is multiplied by (intensity / 10)
+          so Funny@9 dominates over Relaxing@2
+
+    Result normalized to [0, 1].
     """
     combined: dict[str, float] = {}
-    for mood in moods:
-        for genre, weight in MOOD_GENRE_WEIGHTS.get(mood, {}).items():
-            combined[genre] = combined.get(genre, 0.0) + weight
+
+    for mi in mood_intensities:
+        # Scale factor: intensity 1 = 0.1x, intensity 10 = 1.0x
+        scale = mi.intensity / 10.0
+        for genre, base_weight in MOOD_GENRE_WEIGHTS.get(mi.mood, {}).items():
+            combined[genre] = combined.get(genre, 0.0) + base_weight * scale
 
     if not combined:
         return {}
@@ -56,23 +62,26 @@ async def create_mood_session(
     user: dict = Depends(get_current_user),
 ):
     """
-    Accept user-selected moods, compute genre weights, persist a mood
-    session document, and return the session ID for use in /recommendations.
+    Accept user-selected moods with per-mood intensities.
+    Computes intensity-weighted genre weights and persists the session.
     """
-    session_id = str(uuid.uuid4())
+    session_id    = str(uuid.uuid4())
     genre_weights = compute_genre_weights(payload.moods)
+    intensities   = {mi.mood.value: mi.intensity for mi in payload.moods}
+    mood_tags     = [mi.mood for mi in payload.moods]
 
     db = get_db()
     db.collection("mood_sessions").document(session_id).set({
-        "uid": user["uid"],
-        "moods": [m.value for m in payload.moods],
-        "intensity": payload.intensity,
+        "uid":           user["uid"],
+        "moods":         [m.value for m in mood_tags],
+        "intensities":   intensities,
         "genre_weights": genre_weights,
     })
 
     return MoodResponse(
         session_id=session_id,
-        moods=payload.moods,
+        moods=mood_tags,
+        intensities=intensities,
         genre_weights=genre_weights,
     )
 

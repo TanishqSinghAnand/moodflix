@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import { useAuthStore } from "@/hooks/useAuth";
-import { apiGetImportStatus } from "@/lib/api";
+import { apiGetImportStatus, apiGetOnboardingStatus } from "@/lib/api";
 import MoodPicker from "@/components/mood/MoodPicker";
 import ImportPanel from "@/components/media/ImportPanel";
+import OnboardingQuiz from "@/components/mood/OnboardingQuiz";
 import NavBar from "@/components/layout/NavBar";
 import { Library, Sparkles } from "lucide-react";
 import toast from "react-hot-toast";
@@ -18,27 +19,31 @@ export default function DashboardPage() {
   const { user, loading, init } = useAuthStore();
   const [tab, setTab] = useState<Tab>("mood");
   const [importCounts, setImportCounts] = useState<Record<string, number>>({});
+  const [onboardingDone, setOnboardingDone] = useState<boolean | null>(null);
 
-  // Initialize auth listener
   useEffect(() => {
     const unsub = init();
     return unsub;
   }, [init]);
 
-  // Redirect to home if not authenticated
   useEffect(() => {
     if (!loading && !user) router.push("/");
   }, [user, loading, router]);
 
-  // Load import stats
+  // Check onboarding status + import counts on mount
   useEffect(() => {
     if (!user) return;
+
+    apiGetOnboardingStatus()
+      .then((s) => setOnboardingDone(s.onboarding_complete))
+      .catch(() => setOnboardingDone(true)); // fail open — show dashboard
+
     apiGetImportStatus()
       .then((r) => setImportCounts(r.totals))
-      .catch(() => {}); // non-critical
+      .catch(() => {});
   }, [user]);
 
-  if (loading || !user) {
+  if (loading || !user || onboardingDone === null) {
     return (
       <div className="min-h-dvh flex items-center justify-center">
         <div className="w-8 h-8 rounded-full border-2 border-accent border-t-transparent animate-spin" />
@@ -48,6 +53,25 @@ export default function DashboardPage() {
 
   const totalWatched = Object.values(importCounts).reduce((a, b) => a + b, 0);
 
+  /* ── Onboarding gate ──────────────────────────────────────────────────────── */
+  if (!onboardingDone) {
+    return (
+      <div className="min-h-dvh flex flex-col">
+        <NavBar />
+        <div className="flex-1 max-w-2xl mx-auto w-full px-4 py-8">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="glass rounded-3xl p-6"
+          >
+            <OnboardingQuiz onComplete={() => setOnboardingDone(true)} />
+          </motion.div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ── Main dashboard ───────────────────────────────────────────────────────── */
   return (
     <div className="min-h-dvh flex flex-col">
       <NavBar />
@@ -62,7 +86,11 @@ export default function DashboardPage() {
           className="mb-8"
         >
           <p className="text-ink-secondary text-sm mb-1">
-            {new Date().getHours() < 12 ? "Good morning" : new Date().getHours() < 18 ? "Good afternoon" : "Good evening"},{" "}
+            {new Date().getHours() < 12
+              ? "Good morning"
+              : new Date().getHours() < 18
+                ? "Good afternoon"
+                : "Good evening"},{" "}
           </p>
           <h1 className="font-display font-bold text-3xl text-ink-primary">
             {user.displayName?.split(" ")[0] ?? "there"} 👋
@@ -99,12 +127,17 @@ export default function DashboardPage() {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.3 }}
         >
-          {tab === "mood"   && <MoodPicker />}
+          {tab === "mood" && <MoodPicker />}
           {tab === "import" && (
-            <ImportPanel onImportSuccess={(platform, count) => {
-              setImportCounts(prev => ({ ...prev, [platform]: (prev[platform] ?? 0) + count }));
-              toast.success(`Imported ${count} titles from ${platform}!`);
-            }} />
+            <ImportPanel
+              onImportSuccess={(platform, count) => {
+                setImportCounts((prev) => ({
+                  ...prev,
+                  [platform]: (prev[platform] ?? 0) + count,
+                }));
+                toast.success(`Imported ${count} titles from ${platform}!`);
+              }}
+            />
           )}
         </motion.div>
       </div>
